@@ -341,7 +341,9 @@ def chat(
     """
     Hold an ongoing chat with a model.
     """
-    readline.parse_and_bind("")
+    # Left and right arrow keys to move cursor:
+    readline.parse_and_bind("\\e[D: backward-char")
+    readline.parse_and_bind("\\e[C: forward-char")
     log_path = logs_db_path()
     (log_path.parent).mkdir(parents=True, exist_ok=True)
     db = sqlite_utils.Database(log_path)
@@ -515,6 +517,7 @@ def keys_set(name, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(json.dumps(default))
+        path.chmod(0o600)
     try:
         current = json.loads(path.read_text())
     except json.decoder.JSONDecodeError:
@@ -625,6 +628,7 @@ order by responses_fts.rank desc{limit}
 @click.option("-m", "--model", help="Filter by model or model alias")
 @click.option("-q", "--query", help="Search for logs matching this string")
 @click.option("-t", "--truncate", is_flag=True, help="Truncate long strings in output")
+@click.option("-r", "--response", is_flag=True, help="Just output the last response")
 @click.option(
     "current_conversation",
     "-c",
@@ -651,6 +655,7 @@ def logs_list(
     model,
     query,
     truncate,
+    response,
     current_conversation,
     conversation_id,
     json_output,
@@ -661,6 +666,9 @@ def logs_list(
         raise click.ClickException("No log database found at {}".format(path))
     db = sqlite_utils.Database(path)
     migrate(db)
+
+    if response and not current_conversation and not conversation_id:
+        current_conversation = True
 
     if current_conversation:
         try:
@@ -735,9 +743,13 @@ def logs_list(
                 else:
                     row[key] = json.loads(row[key])
 
-    # Output as JSON if request
     if json_output:
+        # Output as JSON if requested
         click.echo(json.dumps(list(rows), indent=2))
+    elif response:
+        # Just output the last response
+        if rows:
+            click.echo(rows[-1]["response"])
     else:
         # Output neatly formatted human-readable logs
         current_system = None
@@ -746,12 +758,16 @@ def logs_list(
             click.echo(
                 "# {}{}\n{}".format(
                     row["datetime_utc"].split(".")[0],
-                    "    conversation: {}".format(row["conversation_id"])
-                    if should_show_conversation
-                    else "",
-                    "\nModel: **{}**\n".format(row["model"])
-                    if should_show_conversation
-                    else "",
+                    (
+                        "    conversation: {}".format(row["conversation_id"])
+                        if should_show_conversation
+                        else ""
+                    ),
+                    (
+                        "\nModel: **{}**\n".format(row["model"])
+                        if should_show_conversation
+                        else ""
+                    ),
                 )
             )
             # In conversation log mode only show it for the first one

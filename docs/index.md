@@ -25,16 +25,20 @@ For more check out [the llm tag](https://simonwillison.net/tags/llm/) on my blog
 
 ## Quick start
 
-First, install LLM using `pip`:
+First, install LLM using `pip` or Homebrew or `pipx`:
 
 ```bash
 pip install llm
 ```
-Or with [pipx](https://pipxproject.github.io/pipx/) (recommended, as then it won't clash with any other installed packages):
+Or with Homebrew (see {ref}`warning note <homebrew-warning>`):
+```bash
+brew install llm
+```
+Or with [pipx](https://pypa.github.io/pipx/):
 ```bash
 pipx install llm
 ```
-If you have an [OpenAI API key](https://platform.openai.com/account/api-keys) key you can run this:
+If you have an [OpenAI API key](https://platform.openai.com/api-keys) key you can run this:
 ```bash
 # Paste your OpenAI API key into this
 llm keys set openai
@@ -76,6 +80,7 @@ maxdepth: 3
 ---
 setup
 usage
+openai-models
 other-models
 embeddings/index
 plugins/index

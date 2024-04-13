@@ -1,29 +1,24 @@
 from llm import EmbeddingModel, Model, hookimpl
 import llm
-from llm.utils import dicts_to_table_string
+from llm.utils import dicts_to_table_string, remove_dict_none_values, logging_client
 import click
 import datetime
+import httpx
 import openai
 import os
 
 try:
+    # Pydantic 2
     from pydantic import field_validator, Field  # type: ignore
+
 except ImportError:
+    # Pydantic 1
     from pydantic.fields import Field
     from pydantic.class_validators import validator as field_validator  # type: ignore [no-redef]
-import requests
+
 from typing import List, Iterable, Iterator, Optional, Union
 import json
 import yaml
-
-if os.environ.get("LLM_OPENAI_SHOW_RESPONSES"):
-
-    def log_response(response, *args, **kwargs):
-        click.echo(response.text, err=True)
-        return response
-
-    openai.requestssession = requests.Session()
-    openai.requestssession.hooks["response"].append(log_response)
 
 
 @hookimpl
@@ -31,8 +26,12 @@ def register_models(register):
     register(Chat("gpt-3.5-turbo"), aliases=("3.5", "chatgpt"))
     register(Chat("gpt-3.5-turbo-16k"), aliases=("chatgpt-16k", "3.5-16k"))
     register(Chat("gpt-4"), aliases=("4", "gpt4"))
-    register(Chat("gpt-4-1106-preview"), aliases=("gpt-4-turbo", "4-turbo", "4t"))
     register(Chat("gpt-4-32k"), aliases=("4-32k",))
+    # GPT-4 turbo models
+    register(Chat("gpt-4-1106-preview"))
+    register(Chat("gpt-4-0125-preview"))
+    register(Chat("gpt-4-turbo-preview"), aliases=("gpt-4-turbo", "4-turbo", "4t"))
+    # The -instruct completion model
     register(
         Completion("gpt-3.5-turbo-instruct", default_max_tokens=256),
         aliases=("3.5-instruct", "chatgpt-instruct"),
@@ -78,20 +77,37 @@ def register_models(register):
 
 @hookimpl
 def register_embedding_models(register):
-    register(Ada002(), aliases=("ada",))
+    register(
+        OpenAIEmbeddingModel("ada-002", "text-embedding-ada-002"), aliases=("ada",)
+    )
+    register(OpenAIEmbeddingModel("3-small", "text-embedding-3-small"))
+    register(OpenAIEmbeddingModel("3-large", "text-embedding-3-large"))
+    # With varying dimensions
+    register(OpenAIEmbeddingModel("3-small-512", "text-embedding-3-small", 512))
+    register(OpenAIEmbeddingModel("3-large-256", "text-embedding-3-large", 256))
+    register(OpenAIEmbeddingModel("3-large-1024", "text-embedding-3-large", 1024))
 
 
-class Ada002(EmbeddingModel):
-    model_id = "ada-002"
+class OpenAIEmbeddingModel(EmbeddingModel):
     needs_key = "openai"
     key_env_var = "OPENAI_API_KEY"
-    batch_size = 100  # Maybe this should be 2048
+    batch_size = 100
+
+    def __init__(self, model_id, openai_model_id, dimensions=None):
+        self.model_id = model_id
+        self.openai_model_id = openai_model_id
+        self.dimensions = dimensions
 
     def embed_batch(self, items: Iterable[Union[str, bytes]]) -> Iterator[List[float]]:
-        results = openai.Embedding.create(
-            input=items, model="text-embedding-ada-002", api_key=self.get_key()
-        )["data"]
-        return ([float(r) for r in result["embedding"]] for result in results)
+        kwargs = {
+            "input": items,
+            "model": self.openai_model_id,
+        }
+        if self.dimensions:
+            kwargs["dimensions"] = self.dimensions
+        client = openai.OpenAI(api_key=self.get_key())
+        results = client.embeddings.create(**kwargs).data
+        return ([float(r) for r in result.embedding] for result in results)
 
 
 @hookimpl
@@ -108,7 +124,7 @@ def register_commands(cli):
         from llm.cli import get_key
 
         api_key = get_key(key, "openai", "OPENAI_API_KEY")
-        response = requests.get(
+        response = httpx.get(
             "https://api.openai.com/v1/models",
             headers={"Authorization": f"Bearer {api_key}"},
         )
@@ -137,6 +153,94 @@ def register_commands(cli):
             print("\n".join(done))
 
 
+class SharedOptions(llm.Options):
+    temperature: Optional[float] = Field(
+        description=(
+            "What sampling temperature to use, between 0 and 2. Higher values like "
+            "0.8 will make the output more random, while lower values like 0.2 will "
+            "make it more focused and deterministic."
+        ),
+        ge=0,
+        le=2,
+        default=None,
+    )
+    max_tokens: Optional[int] = Field(
+        description="Maximum number of tokens to generate.", default=None
+    )
+    top_p: Optional[float] = Field(
+        description=(
+            "An alternative to sampling with temperature, called nucleus sampling, "
+            "where the model considers the results of the tokens with top_p "
+            "probability mass. So 0.1 means only the tokens comprising the top "
+            "10% probability mass are considered. Recommended to use top_p or "
+            "temperature but not both."
+        ),
+        ge=0,
+        le=1,
+        default=None,
+    )
+    frequency_penalty: Optional[float] = Field(
+        description=(
+            "Number between -2.0 and 2.0. Positive values penalize new tokens based "
+            "on their existing frequency in the text so far, decreasing the model's "
+            "likelihood to repeat the same line verbatim."
+        ),
+        ge=-2,
+        le=2,
+        default=None,
+    )
+    presence_penalty: Optional[float] = Field(
+        description=(
+            "Number between -2.0 and 2.0. Positive values penalize new tokens based "
+            "on whether they appear in the text so far, increasing the model's "
+            "likelihood to talk about new topics."
+        ),
+        ge=-2,
+        le=2,
+        default=None,
+    )
+    stop: Optional[str] = Field(
+        description=("A string where the API will stop generating further tokens."),
+        default=None,
+    )
+    logit_bias: Optional[Union[dict, str]] = Field(
+        description=(
+            "Modify the likelihood of specified tokens appearing in the completion. "
+            'Pass a JSON string like \'{"1712":-100, "892":-100, "1489":-100}\''
+        ),
+        default=None,
+    )
+    seed: Optional[int] = Field(
+        description="Integer seed to attempt to sample deterministically",
+        default=None,
+    )
+
+    @field_validator("logit_bias")
+    def validate_logit_bias(cls, logit_bias):
+        if logit_bias is None:
+            return None
+
+        if isinstance(logit_bias, str):
+            try:
+                logit_bias = json.loads(logit_bias)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON in logit_bias string")
+
+        validated_logit_bias = {}
+        for key, value in logit_bias.items():
+            try:
+                int_key = int(key)
+                int_value = int(value)
+                if -100 <= int_value <= 100:
+                    validated_logit_bias[int_key] = int_value
+                else:
+                    raise ValueError("Value must be between -100 and 100")
+            except ValueError:
+                raise ValueError("Invalid key-value pair in logit_bias dictionary")
+
+        return validated_logit_bias
+
+
 class Chat(Model):
     needs_key = "openai"
     key_env_var = "OPENAI_API_KEY"
@@ -144,92 +248,11 @@ class Chat(Model):
 
     default_max_tokens = None
 
-    class Options(llm.Options):
-        temperature: Optional[float] = Field(
-            description=(
-                "What sampling temperature to use, between 0 and 2. Higher values like "
-                "0.8 will make the output more random, while lower values like 0.2 will "
-                "make it more focused and deterministic."
-            ),
-            ge=0,
-            le=2,
+    class Options(SharedOptions):
+        json_object: Optional[bool] = Field(
+            description="Output a valid JSON object {...}. Prompt must mention JSON.",
             default=None,
         )
-        max_tokens: Optional[int] = Field(
-            description="Maximum number of tokens to generate.", default=None
-        )
-        top_p: Optional[float] = Field(
-            description=(
-                "An alternative to sampling with temperature, called nucleus sampling, "
-                "where the model considers the results of the tokens with top_p "
-                "probability mass. So 0.1 means only the tokens comprising the top "
-                "10% probability mass are considered. Recommended to use top_p or "
-                "temperature but not both."
-            ),
-            ge=0,
-            le=1,
-            default=None,
-        )
-        frequency_penalty: Optional[float] = Field(
-            description=(
-                "Number between -2.0 and 2.0. Positive values penalize new tokens based "
-                "on their existing frequency in the text so far, decreasing the model's "
-                "likelihood to repeat the same line verbatim."
-            ),
-            ge=-2,
-            le=2,
-            default=None,
-        )
-        presence_penalty: Optional[float] = Field(
-            description=(
-                "Number between -2.0 and 2.0. Positive values penalize new tokens based "
-                "on whether they appear in the text so far, increasing the model's "
-                "likelihood to talk about new topics."
-            ),
-            ge=-2,
-            le=2,
-            default=None,
-        )
-        stop: Optional[str] = Field(
-            description=("A string where the API will stop generating further tokens."),
-            default=None,
-        )
-        logit_bias: Optional[Union[dict, str]] = Field(
-            description=(
-                "Modify the likelihood of specified tokens appearing in the completion. "
-                'Pass a JSON string like \'{"1712":-100, "892":-100, "1489":-100}\''
-            ),
-            default=None,
-        )
-        seed: Optional[int] = Field(
-            description="Integer seed to attempt to sample deterministically",
-            default=None,
-        )
-
-        @field_validator("logit_bias")
-        def validate_logit_bias(cls, logit_bias):
-            if logit_bias is None:
-                return None
-
-            if isinstance(logit_bias, str):
-                try:
-                    logit_bias = json.loads(logit_bias)
-                except json.JSONDecodeError:
-                    raise ValueError("Invalid JSON in logit_bias string")
-
-            validated_logit_bias = {}
-            for key, value in logit_bias.items():
-                try:
-                    int_key = int(key)
-                    int_value = int(value)
-                    if -100 <= int_value <= 100:
-                        validated_logit_bias[int_key] = int_value
-                    else:
-                        raise ValueError("Value must be between -100 and 100")
-                except ValueError:
-                    raise ValueError("Invalid key-value pair in logit_bias dictionary")
-
-            return validated_logit_bias
 
     def __init__(
         self,
@@ -276,8 +299,9 @@ class Chat(Model):
         messages.append({"role": "user", "content": prompt.prompt})
         response._prompt_json = {"messages": messages}
         kwargs = self.build_kwargs(prompt)
+        client = self.get_client()
         if stream:
-            completion = openai.ChatCompletion.create(
+            completion = client.chat.completions.create(
                 model=self.model_name or self.model_id,
                 messages=messages,
                 stream=True,
@@ -286,26 +310,24 @@ class Chat(Model):
             chunks = []
             for chunk in completion:
                 chunks.append(chunk)
-                content = chunk["choices"][0].get("delta", {}).get("content")
+                content = chunk.choices[0].delta.content
                 if content is not None:
                     yield content
-            response.response_json = combine_chunks(chunks)
+            response.response_json = remove_dict_none_values(combine_chunks(chunks))
         else:
-            completion = openai.ChatCompletion.create(
+            completion = client.chat.completions.create(
                 model=self.model_name or self.model_id,
                 messages=messages,
                 stream=False,
                 **kwargs,
             )
-            response.response_json = completion.to_dict_recursive()
+            response.response_json = remove_dict_none_values(completion.dict())
             yield completion.choices[0].message.content
 
-    def build_kwargs(self, prompt):
-        kwargs = dict(not_nulls(prompt.options))
-        if "max_tokens" not in kwargs and self.default_max_tokens is not None:
-            kwargs["max_tokens"] = self.default_max_tokens
+    def get_client(self):
+        kwargs = {}
         if self.api_base:
-            kwargs["api_base"] = self.api_base
+            kwargs["base_url"] = self.api_base
         if self.api_type:
             kwargs["api_type"] = self.api_type
         if self.api_version:
@@ -320,12 +342,23 @@ class Chat(Model):
             # openai client library requires one
             kwargs["api_key"] = "DUMMY_KEY"
         if self.headers:
-            kwargs["headers"] = self.headers
+            kwargs["default_headers"] = self.headers
+        if os.environ.get("LLM_OPENAI_SHOW_RESPONSES"):
+            kwargs["http_client"] = logging_client()
+        return openai.OpenAI(**kwargs)
+
+    def build_kwargs(self, prompt):
+        kwargs = dict(not_nulls(prompt.options))
+        json_object = kwargs.pop("json_object", None)
+        if "max_tokens" not in kwargs and self.default_max_tokens is not None:
+            kwargs["max_tokens"] = self.default_max_tokens
+        if json_object:
+            kwargs["response_format"] = {"type": "json_object"}
         return kwargs
 
 
 class Completion(Chat):
-    class Options(Chat.Options):
+    class Options(SharedOptions):
         logprobs: Optional[int] = Field(
             description="Include the log probabilities of most likely N per token",
             default=None,
@@ -352,8 +385,9 @@ class Completion(Chat):
         messages.append(prompt.prompt)
         response._prompt_json = {"messages": messages}
         kwargs = self.build_kwargs(prompt)
+        client = self.get_client()
         if stream:
-            completion = openai.Completion.create(
+            completion = client.completions.create(
                 model=self.model_name or self.model_id,
                 prompt="\n".join(messages),
                 stream=True,
@@ -362,57 +396,53 @@ class Completion(Chat):
             chunks = []
             for chunk in completion:
                 chunks.append(chunk)
-                content = chunk["choices"][0].get("text") or ""
+                content = chunk.choices[0].text
                 if content is not None:
                     yield content
-            response.response_json = combine_chunks(chunks)
+            combined = combine_chunks(chunks)
+            cleaned = remove_dict_none_values(combined)
+            response.response_json = cleaned
         else:
-            completion = openai.Completion.create(
+            completion = client.completions.create(
                 model=self.model_name or self.model_id,
                 prompt="\n".join(messages),
                 stream=False,
                 **kwargs,
             )
-            response.response_json = completion.to_dict_recursive()
-            yield completion.choices[0]["text"]
+            response.response_json = remove_dict_none_values(completion.dict())
+            yield completion.choices[0].text
 
 
 def not_nulls(data) -> dict:
     return {key: value for key, value in data if value is not None}
 
 
-def combine_chunks(chunks: List[dict]) -> dict:
+def combine_chunks(chunks: List) -> dict:
     content = ""
     role = None
     finish_reason = None
-
     # If any of them have log probability, we're going to persist
     # those later on
     logprobs = []
 
     for item in chunks:
-        for choice in item["choices"]:
-            if (
-                "logprobs" in choice
-                and "text" in choice
-                and isinstance(choice["logprobs"], dict)
-                and "top_logprobs" in choice["logprobs"]
-            ):
+        for choice in item.choices:
+            if choice.logprobs and hasattr(choice.logprobs, "top_logprobs"):
                 logprobs.append(
                     {
-                        "text": choice["text"],
-                        "top_logprobs": choice["logprobs"]["top_logprobs"],
+                        "text": choice.text if hasattr(choice, "text") else None,
+                        "top_logprobs": choice.logprobs.top_logprobs,
                     }
                 )
-            if "text" in choice and "delta" not in choice:
-                content += choice["text"]
+
+            if not hasattr(choice, "delta"):
+                content += choice.text
                 continue
-            if "role" in choice["delta"]:
-                role = choice["delta"]["role"]
-            if "content" in choice["delta"]:
-                content += choice["delta"]["content"]
-            if choice.get("finish_reason") is not None:
-                finish_reason = choice["finish_reason"]
+            role = choice.delta.role
+            if choice.delta.content is not None:
+                content += choice.delta.content
+            if choice.finish_reason is not None:
+                finish_reason = choice.finish_reason
 
     # Imitations of the OpenAI API may be missing some of these fields
     combined = {
@@ -423,7 +453,8 @@ def combine_chunks(chunks: List[dict]) -> dict:
     if logprobs:
         combined["logprobs"] = logprobs
     for key in ("id", "object", "model", "created", "index"):
-        if key in chunks[0]:
-            combined[key] = chunks[0][key]
+        value = getattr(chunks[0], key, None)
+        if value is not None:
+            combined[key] = value
 
     return combined

@@ -3,8 +3,10 @@ import json
 from llm.cli import cli
 import pathlib
 import pytest
+import sys
 
 
+@pytest.mark.xfail(sys.platform == "win32", reason="Expected to fail on Windows")
 @pytest.mark.parametrize("env", ({}, {"LLM_USER_PATH": "/tmp/llm-keys-test"}))
 def test_keys_in_user_path(monkeypatch, env, user_path):
     for key, value in env.items():
@@ -19,13 +21,19 @@ def test_keys_in_user_path(monkeypatch, env, user_path):
     assert result.output.strip() == expected
 
 
+@pytest.mark.xfail(sys.platform == "win32", reason="Expected to fail on Windows")
 def test_keys_set(monkeypatch, tmpdir):
-    user_path = str(tmpdir / "user/keys")
-    monkeypatch.setenv("LLM_USER_PATH", user_path)
+    user_path = tmpdir / "user/keys"
+    monkeypatch.setenv("LLM_USER_PATH", str(user_path))
+    keys_path = user_path / "keys.json"
+    assert not keys_path.exists()
     runner = CliRunner()
     result = runner.invoke(cli, ["keys", "set", "openai"], input="foo")
     assert result.exit_code == 0
-    content = open(user_path + "/keys.json").read()
+    assert keys_path.exists()
+    # Should be chmod 600
+    assert oct(keys_path.stat().mode)[-3:] == "600"
+    content = keys_path.read_text("utf-8")
     assert json.loads(content) == {
         "// Note": "This file stores secret API credentials. Do not share!",
         "openai": "foo",
@@ -57,9 +65,8 @@ def test_uses_correct_key(mocked_openai_chat, monkeypatch, tmpdir):
     monkeypatch.setenv("OPENAI_API_KEY", "from-env")
 
     def assert_key(key):
-        assert mocked_openai_chat.last_request.headers[
-            "Authorization"
-        ] == "Bearer {}".format(key)
+        request = mocked_openai_chat.get_requests()[-1]
+        assert request.headers["Authorization"] == "Bearer {}".format(key)
 
     runner = CliRunner()
 
