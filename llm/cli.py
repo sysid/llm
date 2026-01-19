@@ -564,8 +564,6 @@ def prompt(
         # Convert that schema into multiple "items" of the same schema
         schema = multi_schema(schema)
 
-    model_aliases = get_model_aliases()
-
     def read_prompt():
         nonlocal prompt, schema
 
@@ -611,6 +609,7 @@ def prompt(
         path = template_dir() / f"{save}.yaml"
         to_save = {}
         if model_id:
+            model_aliases = get_model_aliases()
             try:
                 to_save["model"] = model_aliases[model_id].model_id
             except KeyError:
